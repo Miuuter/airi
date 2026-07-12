@@ -2,7 +2,90 @@ import type { ChatHistoryItem } from '../../../types/chat'
 
 import { describe, expect, it } from 'vitest'
 
-import { getChatHistoryItemKey } from './utils'
+import {
+  getChatHistoryItemCopyText,
+  getChatHistoryItemKey,
+  getChatHistoryUserDisplayText,
+  getImageUrlsFromContentParts,
+  normalizeChatContentParts,
+} from './utils'
+
+describe('chat history utils', () => {
+  it('extracts text and image URLs from content part arrays', () => {
+    const imageUrl = 'data:image/png;base64,aW1hZ2U='
+    const message = {
+      role: 'user',
+      content: [
+        { type: 'text', text: 'look at this' },
+        { type: 'image_url', image_url: { url: imageUrl } },
+      ],
+    } satisfies ChatHistoryItem
+
+    expect(getChatHistoryUserDisplayText(message)).toBe('look at this')
+    expect(getImageUrlsFromContentParts(normalizeChatContentParts(message.content))).toEqual([imageUrl])
+    expect(getChatHistoryItemCopyText(message)).toBe('look at this')
+  })
+
+  it('parses serialized content parts instead of showing raw base64 JSON', () => {
+    const imageUrl = 'data:image/png;base64,aW1hZ2U='
+    const message = {
+      role: 'user',
+      content: JSON.stringify([
+        { type: 'text', text: 'serialized image' },
+        { type: 'image_url', image_url: { url: imageUrl } },
+      ]),
+    } satisfies ChatHistoryItem
+
+    const parts = normalizeChatContentParts(message.content)
+
+    expect(getChatHistoryUserDisplayText(message)).toBe('serialized image')
+    expect(getImageUrlsFromContentParts(parts)).toEqual([imageUrl])
+    expect(getChatHistoryItemCopyText(message)).toBe('serialized image')
+  })
+
+  it('builds data URLs from image attachment shaped parts', () => {
+    const parts = normalizeChatContentParts([
+      { type: 'text', text: 'attachment image' },
+      { type: 'image', data: 'aW1hZ2U=', mimeType: 'image/jpeg' },
+    ])
+
+    expect(getImageUrlsFromContentParts(parts)).toEqual(['data:image/jpeg;base64,aW1hZ2U='])
+  })
+
+  it('parses serialized message objects that contain content parts', () => {
+    const imageUrl = 'data:image/png;base64,aW1hZ2U='
+    const message = {
+      role: 'user',
+      content: JSON.stringify({
+        role: 'user',
+        content: [
+          { type: 'text', text: 'serialized object image' },
+          { type: 'input_image', image_url: imageUrl },
+        ],
+      }),
+    } satisfies ChatHistoryItem
+
+    const parts = normalizeChatContentParts(message.content)
+
+    expect(getChatHistoryUserDisplayText(message)).toBe('serialized object image')
+    expect(getImageUrlsFromContentParts(parts)).toEqual([imageUrl])
+    expect(getChatHistoryItemCopyText(message)).toBe('serialized object image')
+  })
+
+  it('treats serialized single image parts as images instead of text', () => {
+    const imageUrl = 'data:image/png;base64,aW1hZ2U='
+    const message = {
+      role: 'user',
+      content: JSON.stringify({ type: 'image_url', image_url: { url: imageUrl } }),
+    } satisfies ChatHistoryItem
+
+    const parts = normalizeChatContentParts(message.content)
+
+    expect(getChatHistoryUserDisplayText(message)).toBe('')
+    expect(getImageUrlsFromContentParts(parts)).toEqual([imageUrl])
+    expect(getChatHistoryItemCopyText(message)).toBe('')
+  })
+})
 
 describe('getChatHistoryItemKey', () => {
   it('prefers stable message ids when available', () => {

@@ -285,7 +285,8 @@ export const useChatOrchestratorStore = defineStore('chat-orchestrator', () => {
         turn_index: turnIndex,
         message_index: chatSession.getSessionMessages(sessionId).length,
         message_length: messageText.length,
-        has_attachment: false,
+        has_attachment: Array.isArray(message.content)
+          && message.content.some(part => part.type === 'image_url'),
         mode: lastSendSource,
       })
       if (turnIndex === 2) {

@@ -35,12 +35,45 @@ function prependTextToContent<T extends { content?: unknown }>(msg: T, text: str
   return msg
 }
 
+function appendTextToContent<T extends { content?: unknown }>(msg: T, text: string): T {
+  const content = msg.content
+  if (content === undefined)
+    return { ...msg, content: text }
+  if (typeof content === 'string')
+    return { ...msg, content: `${content}${text}` }
+  if (Array.isArray(content))
+    return { ...msg, content: [...content, { type: 'text', text }] }
+
+  return msg
+}
+
 function cloneStreamingMessage(message: StreamingAssistantMessage): StreamingAssistantMessage {
   try {
     return structuredClone(message)
   }
   catch {
     return JSON.parse(JSON.stringify(message)) as StreamingAssistantMessage
+  }
+}
+
+function stripImagePartsFromProviderMessages(messages: Message[]) {
+  for (const message of messages) {
+    if (!Array.isArray(message.content))
+      continue
+
+    const textOnlyContent = message.content.filter((part) => {
+      const type = part && typeof part === 'object' && 'type' in part
+        ? (part as { type?: unknown }).type
+        : undefined
+      return type !== 'image_url'
+    })
+
+    if (textOnlyContent.length === message.content.length)
+      continue
+
+    message.content = textOnlyContent.length > 0
+      ? textOnlyContent
+      : '[Image attachment omitted from text-only provider history.]'
   }
 }
 
@@ -56,6 +89,10 @@ export interface ChatOrchestratorSendOptions {
   providerConfig?: Record<string, unknown>
   /** Image attachments appended to the user message content parts. */
   attachments?: { type: 'image', data: string, mimeType: string }[]
+  /** Local-only visual context persisted with the user message and projected to providers. */
+  providerContext?: string
+  /** Remove image parts from provider history when using a text-only chat model. */
+  stripProviderImageAttachments?: boolean
   /** Tool definitions passed through to the LLM stream port. */
   tools?: StreamOptions['tools']
   /** Original transport input metadata used by bridge/devtools observers. */
@@ -377,11 +414,15 @@ export function createChatOrchestratorRuntime(deps: ChatOrchestratorRuntimeDeps)
     const nowTs = now()
 
     return sessionMessagesForSend.map((msg) => {
-      const { context: _context, id: _id, createdAt, ...withoutContext } = msg
+      const { context: _context, id: _id, createdAt, providerContext, ...withoutContext } = msg
       const rawMessage = unwrapMessage(withoutContext)
 
       if (rawMessage.role === 'user') {
-        return prependTextToContent(rawMessage, formatTimePrefix(createdAt ?? nowTs))
+        const timestampedMessage = prependTextToContent(rawMessage, formatTimePrefix(createdAt ?? nowTs))
+        const trimmedProviderContext = providerContext?.trim()
+        return trimmedProviderContext
+          ? appendTextToContent(timestampedMessage, `\n\n[Visual context extracted from the user image attachments]\n${trimmedProviderContext}`)
+          : timestampedMessage
       }
 
       if (rawMessage.role === 'assistant') {
@@ -513,13 +554,14 @@ export function createChatOrchestratorRuntime(deps: ChatOrchestratorRuntimeDeps)
       const userMessage = {
         role: 'user' as const,
         content: finalContent,
+        providerContext: options.providerContext?.trim() || undefined,
         createdAt: sendingCreatedAt,
         id: roundId,
       }
-      deps.session.appendSessionMessage(sessionId, userMessage)
-
       // Cloud sync v1: only the raw text part round-trips; image attachments
       // and other non-text parts stay local.
+      deps.session.appendSessionMessage(sessionId, userMessage)
+
       deps.onUserMessageAppended?.({
         sessionId,
         message: userMessage,
@@ -610,6 +652,9 @@ export function createChatOrchestratorRuntime(deps: ChatOrchestratorRuntimeDeps)
       })
 
       const newMessages = buildProviderMessages(sessionMessagesForSend)
+      if (options.stripProviderImageAttachments)
+        stripImagePartsFromProviderMessages(newMessages as Message[])
+
       const systemPromptSupplement = deps.getSystemPromptSupplement?.()?.trim()
       if (systemPromptSupplement) {
         const systemMessage = newMessages.find(message => message.role === 'system')

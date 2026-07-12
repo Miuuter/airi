@@ -2,11 +2,11 @@
 import type { ChatHistoryItem, ChatMessage } from '../../../../types/chat'
 
 import { isStageCapacitor, isStageWeb } from '@proj-airi/stage-shared'
-import { computed } from 'vue'
+import { computed, shallowRef } from 'vue'
 
 import { MarkdownRenderer } from '../../../markdown'
 import { ChatActionMenu } from '../components/action-menu'
-import { getChatHistoryItemCopyText } from '../utils'
+import { getChatHistoryItemCopyText, getChatHistoryUserDisplayText, getImageUrlsFromContentParts, normalizeChatContentParts } from '../utils'
 
 const props = withDefaults(defineProps<{
   message: Extract<ChatMessage, { role: 'user' }>
@@ -22,20 +22,25 @@ const emit = defineEmits<{
 }>()
 
 const content = computed(() => {
-  const raw = props.message.content
-  if (typeof raw === 'string')
-    return raw
-
-  if (Array.isArray(raw)) {
-    const textPart = raw.find(part => 'type' in part && part.type === 'text') as { text?: string } | undefined
-    if (textPart?.text)
-      return textPart.text
-
-    return raw.map(entry => JSON.stringify(entry)).join('\n')
-  }
-
-  return ''
+  return getChatHistoryUserDisplayText(props.message as ChatHistoryItem)
 })
+
+const imageUrls = computed(() => {
+  return getImageUrlsFromContentParts(normalizeChatContentParts(props.message.content))
+})
+
+const previewImage = shallowRef<{ url: string, title: string } | null>(null)
+
+function openAttachmentPreview(url: string, index: number) {
+  previewImage.value = {
+    title: `Image attachment ${index + 1}`,
+    url,
+  }
+}
+
+function closeImagePreview() {
+  previewImage.value = null
+}
 
 const containerClasses = computed(() => [
   'flex',
@@ -70,11 +75,82 @@ const copyText = computed(() => getChatHistoryItemCopyText(props.message as Chat
             <span text-sm text="black/60 dark:white/65" font-normal class="inline <sm:hidden">{{ label }}</span>
           </div>
           <MarkdownRenderer
+            v-if="content"
             :content="content as string"
+            preview-images
             class="break-words"
           />
+          <div v-if="imageUrls.length" class="mt-2 flex flex-wrap gap-2">
+            <button
+              v-for="(url, index) in imageUrls"
+              :key="`${url.slice(0, 48)}:${index}`"
+              type="button"
+              :aria-label="`Open image attachment ${index + 1}`"
+              :class="[
+                'h-20 w-20 overflow-hidden rounded-md outline-none',
+                'cursor-pointer transition-transform active:scale-[0.98]',
+                'focus-visible:ring-2 focus-visible:ring-primary-500/70',
+              ]"
+              @click.stop="openAttachmentPreview(url, index)"
+            >
+              <img
+                :src="url"
+                :alt="`Image attachment ${index + 1}`"
+                class="h-full w-full object-cover transition-opacity hover:opacity-90"
+              >
+            </button>
+          </div>
         </div>
       </template>
     </ChatActionMenu>
+
+    <Teleport to="body">
+      <Transition name="chat-image-preview-fade">
+        <div
+          v-if="previewImage"
+          class="fixed inset-0 z-[9999] flex items-center justify-center bg-black/70 p-4 backdrop-blur-sm"
+          @click.self="closeImagePreview"
+        >
+          <div
+            role="dialog"
+            aria-modal="true"
+            :aria-label="previewImage.title"
+            :class="[
+              'relative max-h-[90vh] max-w-[94vw] overflow-hidden rounded-xl',
+              'bg-black/30 shadow-2xl',
+            ]"
+          >
+            <button
+              type="button"
+              :class="[
+                'absolute right-2 top-2 z-10 h-8 w-8 flex items-center justify-center rounded-full',
+                'bg-black/55 text-white backdrop-blur-sm transition-colors hover:bg-black/75',
+              ]"
+              title="Close preview"
+              @click="closeImagePreview"
+            >
+              <div class="i-solar:close-circle-bold-duotone text-lg" />
+            </button>
+            <img
+              :src="previewImage.url"
+              :alt="previewImage.title"
+              class="max-h-[88vh] max-w-[94vw] object-contain"
+            >
+          </div>
+        </div>
+      </Transition>
+    </Teleport>
   </div>
 </template>
+
+<style scoped>
+.chat-image-preview-fade-enter-active,
+.chat-image-preview-fade-leave-active {
+  transition: opacity 0.16s ease;
+}
+
+.chat-image-preview-fade-enter-from,
+.chat-image-preview-fade-leave-to {
+  opacity: 0;
+}
+</style>

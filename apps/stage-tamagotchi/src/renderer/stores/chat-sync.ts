@@ -6,6 +6,7 @@ import type { ChatProvider } from '@xsai-ext/providers/utils'
 
 import { errorMessageFrom } from '@moeru/std'
 import { errorMessageFromValue } from '@proj-airi/stage-shared'
+import { useVisionInference } from '@proj-airi/stage-ui/composables'
 import { extractMessageText } from '@proj-airi/stage-ui/libs/chat-sync/wire-message'
 import { useChatOrchestratorStore } from '@proj-airi/stage-ui/stores/chat'
 import { useChatMaintenanceStore } from '@proj-airi/stage-ui/stores/chat/maintenance'
@@ -13,6 +14,7 @@ import { useChatSessionStore } from '@proj-airi/stage-ui/stores/chat/session-sto
 import { useChatStreamStore } from '@proj-airi/stage-ui/stores/chat/stream-store'
 import { resolveLlmTools } from '@proj-airi/stage-ui/stores/llm-tool-resolver'
 import { useConsciousnessStore } from '@proj-airi/stage-ui/stores/modules/consciousness'
+import { useVisionStore } from '@proj-airi/stage-ui/stores/modules/vision'
 import { useProvidersStore } from '@proj-airi/stage-ui/stores/providers'
 import { executeToolCallRerun } from '@proj-airi/stage-ui/stores/tool-call-rerun'
 import { defineStore, storeToRefs } from 'pinia'
@@ -99,7 +101,14 @@ interface PendingRequest {
 const CHAT_SYNC_CHANNEL_NAME = 'airi:stage-tamagotchi:chat-sync'
 const AUTHORITY_HEARTBEAT_INTERVAL_MS = 1000
 const REQUEST_TIMEOUT_MS = 30000
+const INGEST_REQUEST_TIMEOUT_MS = 5 * 60 * 1000
 const SPOTLIGHT_REQUEST_TIMEOUT_MS = 5 * 60 * 1000
+const CHAT_ATTACHMENT_VISION_PROMPT = [
+  'You are preparing visual context for a text-only chat model.',
+  'Describe this image factually and concisely.',
+  'Include visible text, UI state, errors, objects, and details needed to answer the user.',
+  'Do not answer the user directly.',
+].join('\n')
 
 function createRequestId() {
   return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`
@@ -174,6 +183,16 @@ function logChatSyncError(message: string, error: unknown, details: Record<strin
   })
 }
 
+function attachmentToDataUrl(attachment: AttachmentPayload) {
+  return `data:${attachment.mimeType};base64,${attachment.data}`
+}
+
+function formatVisionBridgeContext(descriptions: string[]) {
+  return descriptions
+    .map((description, index) => `Image ${index + 1}:\n${description.trim()}`)
+    .join('\n\n')
+}
+
 export const useChatSyncStore = defineStore('stage-tamagotchi:chat-sync', () => {
   const instanceId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`
   const mode = ref<ChatSyncMode>('inactive')
@@ -185,7 +204,10 @@ export const useChatSyncStore = defineStore('stage-tamagotchi:chat-sync', () => 
   const { cleanupMessages } = useChatMaintenanceStore()
   const providersStore = useProvidersStore()
   const consciousnessStore = useConsciousnessStore()
+  const visionStore = useVisionStore()
+  const { runVisionInference } = useVisionInference()
   const { activeProvider, activeModel } = storeToRefs(consciousnessStore)
+  const { activeProvider: activeVisionProvider, activeModel: activeVisionModel } = storeToRefs(visionStore)
   const { activeSessionId, sessionMessages, sessionMetas } = storeToRefs(chatSession)
   const { streamingMessage } = storeToRefs(chatStream)
   const { sending } = storeToRefs(chatOrchestrator)
@@ -324,6 +346,27 @@ export const useChatSyncStore = defineStore('stage-tamagotchi:chat-sync', () => 
     return assistant ? extractMessageText(assistant) : ''
   }
 
+  async function buildAttachmentVisionPrompt(payload: IngestCommandPayload) {
+    const attachments = payload.attachments?.filter(attachment => attachment.type === 'image') ?? []
+    if (!attachments.length || !activeVisionProvider.value || !activeVisionModel.value)
+      return undefined
+
+    const descriptions: string[] = []
+    for (const attachment of attachments) {
+      const description = await runVisionInference({
+        imageDataUrl: attachmentToDataUrl(attachment),
+        workloadId: 'screen:interpret',
+        promptOverride: CHAT_ATTACHMENT_VISION_PROMPT,
+      })
+      if (!description.trim())
+        throw new Error('Vision model returned an empty image description')
+
+      descriptions.push(description)
+    }
+
+    return formatVisionBridgeContext(descriptions)
+  }
+
   async function executeIngest(payload: IngestCommandPayload): Promise<void> {
     const providerId = activeProvider.value
     const modelId = activeModel.value
@@ -336,13 +379,24 @@ export const useChatSyncStore = defineStore('stage-tamagotchi:chat-sync', () => 
       throw new Error(`Failed to resolve chat provider "${providerId}"`)
     }
 
-    await chatOrchestrator.ingest(payload.text, {
+    const shouldUseVisionBridge = !!activeVisionProvider.value
+      && !!activeVisionModel.value
+      && (providerId !== activeVisionProvider.value || modelId !== activeVisionModel.value)
+    const providerContext = shouldUseVisionBridge
+      ? await buildAttachmentVisionPrompt(payload)
+      : undefined
+
+    const sendOptions = {
       model: modelId,
       chatProvider,
       attachments: payload.attachments,
+      providerContext,
+      stripProviderImageAttachments: shouldUseVisionBridge,
       input: payload.input,
       tools: resolveTools(payload.toolset),
-    }, payload.sessionId)
+    }
+
+    await chatOrchestrator.ingest(payload.text, sendOptions, payload.sessionId)
   }
 
   async function executeSpotlightIngest(payload: SpotlightIngestPayload): Promise<SpotlightIngestResult> {
@@ -627,7 +681,7 @@ export const useChatSyncStore = defineStore('stage-tamagotchi:chat-sync', () => 
       senderId: instanceId,
       command: 'ingest',
       payload,
-    })
+    }, INGEST_REQUEST_TIMEOUT_MS, () => new Error('Chat response timed out'))
   }
 
   async function requestSpotlightIngest(payload: SpotlightIngestPayload) {

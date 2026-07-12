@@ -5,7 +5,7 @@ import type { Ref } from 'vue'
 
 import { createPinia, setActivePinia } from 'pinia'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { computed, ref } from 'vue'
+import { ref } from 'vue'
 
 const mockResolveLlmTools = vi.hoisted(() => vi.fn<(options?: { customTools?: (() => Promise<Tool[]>) | Tool[] }) => Promise<Tool[]>>())
 const mockWidgetsTools = vi.hoisted(() => vi.fn<() => Promise<Tool[]>>(async () => []))
@@ -100,6 +100,10 @@ function assistantMessage(content: string): MockChatMessage {
 }
 
 interface MockState {
+  activeChatProvider: Ref<string>
+  activeChatModel: Ref<string>
+  activeVisionProvider: Ref<string>
+  activeVisionModel: Ref<string>
   activeSessionId: Ref<string>
   sessionMessages: Ref<Record<string, MockChatMessage[]>>
   sessionMetas: Ref<Record<string, unknown>>
@@ -110,6 +114,7 @@ interface MockState {
 }
 
 let mockState: MockState
+const runVisionInference = vi.fn()
 
 vi.mock('@proj-airi/stage-ui/stores/chat/session-store', () => ({
   useChatSessionStore: () => ({
@@ -152,10 +157,23 @@ vi.mock('@proj-airi/stage-ui/stores/providers', () => ({
   }),
 }))
 
+vi.mock('@proj-airi/stage-ui/composables', () => ({
+  useVisionInference: () => ({
+    runVisionInference,
+  }),
+}))
+
 vi.mock('@proj-airi/stage-ui/stores/modules/consciousness', () => ({
   useConsciousnessStore: () => ({
-    activeProvider: computed(() => 'provider-id'),
-    activeModel: computed(() => 'model-id'),
+    activeProvider: mockState.activeChatProvider,
+    activeModel: mockState.activeChatModel,
+  }),
+}))
+
+vi.mock('@proj-airi/stage-ui/stores/modules/vision', () => ({
+  useVisionStore: () => ({
+    activeProvider: mockState.activeVisionProvider,
+    activeModel: mockState.activeVisionModel,
   }),
 }))
 
@@ -198,8 +216,13 @@ describe('useChatSyncStore', async () => {
     setActivePinia(createPinia())
     MockBroadcastChannel.reset()
     vi.restoreAllMocks()
+    runVisionInference.mockReset()
 
     const activeSessionId = ref('session-1')
+    const activeChatProvider = ref('provider-id')
+    const activeChatModel = ref('model-id')
+    const activeVisionProvider = ref('vision-provider-id')
+    const activeVisionModel = ref('vision-model-id')
     const sessionMessages = ref<Record<string, MockChatMessage[]>>({
       'session-1': [{ role: 'system', content: 'init' }],
     })
@@ -234,6 +257,10 @@ describe('useChatSyncStore', async () => {
     mockImageJournalTools.mockResolvedValue([])
 
     mockState = {
+      activeChatProvider,
+      activeChatModel,
+      activeVisionProvider,
+      activeVisionModel,
       activeSessionId,
       sessionMessages,
       sessionMetas,
@@ -282,24 +309,168 @@ describe('useChatSyncStore', async () => {
     store.dispose()
   })
 
-  it('rejects follower command timeouts after thirty seconds', async () => {
+  it('keeps long-running follower ingest requests alive past thirty seconds', async () => {
     vi.useFakeTimers()
     vi.spyOn(console, 'error').mockImplementation(() => {})
     const store = useChatSyncStore()
     store.initialize('follower')
 
+    let rejected = false
     const pending = store.requestIngest({
       text: 'hello timeout',
       sessionId: 'session-1',
+    }).catch((error) => {
+      rejected = true
+      throw error
     })
-    const expectedRejection = expect(pending).rejects.toThrow('Timed out waiting for chat authority response')
+    const expectedRejection = expect(pending).rejects.toThrow('Chat response timed out')
 
     await vi.advanceTimersByTimeAsync(30000)
+    expect(rejected).toBe(false)
+
+    await vi.advanceTimersByTimeAsync(270000)
 
     await expectedRejection
 
     store.dispose()
     vi.useRealTimers()
+  })
+
+  it('bridges image attachments when providers differ even if model ids match', async () => {
+    mockState.activeVisionModel.value = 'model-id'
+    mockState.ingest.mockResolvedValueOnce(undefined)
+    runVisionInference.mockResolvedValueOnce('A visible error dialog.')
+    const store = useChatSyncStore()
+    store.initialize('authority')
+
+    await store.requestIngest({
+      text: 'What happened?',
+      attachments: [
+        { type: 'image', mimeType: 'image/png', data: 'aW1hZ2U=' },
+      ],
+    })
+
+    expect(runVisionInference).toHaveBeenCalledTimes(1)
+    expect(mockState.ingest).toHaveBeenCalledWith('What happened?', expect.objectContaining({
+      providerContext: 'Image 1:\nA visible error dialog.',
+      stripProviderImageAttachments: true,
+    }), undefined)
+
+    store.dispose()
+  })
+
+  it('preserves image order when bridging multiple attachments without text', async () => {
+    mockState.ingest.mockResolvedValueOnce(undefined)
+    runVisionInference
+      .mockResolvedValueOnce('First image description.')
+      .mockResolvedValueOnce('Second image description.')
+    const store = useChatSyncStore()
+    store.initialize('authority')
+
+    await store.requestIngest({
+      text: '',
+      attachments: [
+        { type: 'image', mimeType: 'image/png', data: 'Zmlyc3Q=' },
+        { type: 'image', mimeType: 'image/jpeg', data: 'c2Vjb25k' },
+      ],
+    })
+
+    expect(runVisionInference.mock.calls.map(call => call[0].imageDataUrl)).toEqual([
+      'data:image/png;base64,Zmlyc3Q=',
+      'data:image/jpeg;base64,c2Vjb25k',
+    ])
+    expect(mockState.ingest).toHaveBeenCalledWith('', expect.objectContaining({
+      providerContext: [
+        'Image 1:',
+        'First image description.',
+        '',
+        'Image 2:',
+        'Second image description.',
+      ].join('\n'),
+    }), undefined)
+
+    store.dispose()
+  })
+
+  it('sends original images directly when provider and model both match', async () => {
+    mockState.activeVisionProvider.value = 'provider-id'
+    mockState.activeVisionModel.value = 'model-id'
+    mockState.ingest.mockResolvedValueOnce(undefined)
+    const store = useChatSyncStore()
+    store.initialize('authority')
+
+    await store.requestIngest({
+      text: 'Look at this',
+      attachments: [
+        { type: 'image', mimeType: 'image/png', data: 'aW1hZ2U=' },
+      ],
+    })
+
+    expect(runVisionInference).not.toHaveBeenCalled()
+    expect(mockState.ingest).toHaveBeenCalledWith('Look at this', expect.objectContaining({
+      providerContext: undefined,
+      stripProviderImageAttachments: false,
+    }), undefined)
+
+    store.dispose()
+  })
+
+  it('lets the chat model handle images when vision is not configured', async () => {
+    mockState.activeVisionProvider.value = ''
+    mockState.activeVisionModel.value = ''
+    mockState.ingest.mockResolvedValueOnce(undefined)
+    const store = useChatSyncStore()
+    store.initialize('authority')
+
+    await store.requestIngest({
+      text: '',
+      attachments: [
+        { type: 'image', mimeType: 'image/png', data: 'aW1hZ2U=' },
+      ],
+    })
+
+    expect(runVisionInference).not.toHaveBeenCalled()
+    expect(mockState.ingest).toHaveBeenCalledTimes(1)
+
+    store.dispose()
+  })
+
+  it('does not ingest a partial message when any image analysis fails', async () => {
+    runVisionInference
+      .mockResolvedValueOnce('First image.')
+      .mockRejectedValueOnce(new Error('Vision failed'))
+    const store = useChatSyncStore()
+    store.initialize('authority')
+
+    await expect(store.requestIngest({
+      text: 'Compare these',
+      attachments: [
+        { type: 'image', mimeType: 'image/png', data: 'Zmlyc3Q=' },
+        { type: 'image', mimeType: 'image/png', data: 'c2Vjb25k' },
+      ],
+    })).rejects.toThrow('Vision failed')
+
+    expect(runVisionInference).toHaveBeenCalledTimes(2)
+    expect(mockState.ingest).not.toHaveBeenCalled()
+
+    store.dispose()
+  })
+
+  it('does not ingest an image when vision returns an empty description', async () => {
+    runVisionInference.mockResolvedValueOnce('   ')
+    const store = useChatSyncStore()
+    store.initialize('authority')
+
+    await expect(store.requestIngest({
+      text: 'Describe this',
+      attachments: [
+        { type: 'image', mimeType: 'image/png', data: 'aW1hZ2U=' },
+      ],
+    })).rejects.toThrow('Vision model returned an empty image description')
+
+    expect(mockState.ingest).not.toHaveBeenCalled()
+
+    store.dispose()
   })
 
   it('replaces the last failed turn before retrying', async () => {

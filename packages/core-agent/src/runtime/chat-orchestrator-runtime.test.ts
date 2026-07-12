@@ -695,4 +695,84 @@ describe('createChatOrchestratorRuntime', () => {
     expect(harness.assistantAppended).toHaveLength(1)
     expect(harness.foregroundResets).toHaveLength(1)
   })
+
+  /**
+   * @example
+   * A text-only model receives vision-derived context instead of raw image parts.
+   */
+  it('keeps attachments in chat history while sending text-only visual context to the provider', async () => {
+    const harness = createHarness()
+    let composedMessages: Message[] = []
+    harness.sessionMessages['session-1']?.push({
+      role: 'user',
+      content: [
+        { type: 'text', text: 'previous image' },
+        {
+          type: 'image_url',
+          image_url: {
+            url: 'data:image/png;base64,b2xk',
+          },
+        } as never,
+      ],
+      providerContext: 'Image 1:\nA previous settings screen.',
+      createdAt: new Date(2026, 3, 25, 18, 30).getTime(),
+      id: 'previous-user',
+    })
+    harness.stream.mockImplementationOnce(async (_model, _chatProvider, messages, options) => {
+      composedMessages = messages
+      await options?.onStreamEvent?.({ type: 'text-delta', text: 'visual reply' })
+      await options?.onStreamEvent?.({ type: 'finish', finishReason: 'stop' })
+    })
+
+    await harness.runtime.ingest('can you see this?', {
+      model: 'text-only-model',
+      chatProvider: provider,
+      attachments: [
+        {
+          type: 'image',
+          data: 'bmV3',
+          mimeType: 'image/png',
+        },
+      ],
+      providerContext: 'Image 1:\nA screenshot of an error.',
+      stripProviderImageAttachments: true,
+    })
+
+    expect(harness.sessionMessages['session-1']?.at(-2)?.content).toEqual([
+      {
+        type: 'text',
+        text: 'can you see this?',
+      },
+      {
+        type: 'image_url',
+        image_url: {
+          url: 'data:image/png;base64,bmV3',
+        },
+      },
+    ])
+    expect(harness.sessionMessages['session-1']?.at(-2)?.providerContext).toBe('Image 1:\nA screenshot of an error.')
+    expect(composedMessages.some((message) => {
+      return Array.isArray(message.content)
+        && message.content.some(part => part && typeof part === 'object' && 'type' in part && (part as { type?: unknown }).type === 'image_url')
+    })).toBe(false)
+    expect(JSON.stringify(composedMessages)).toContain('A previous settings screen.')
+    expect(JSON.stringify(composedMessages.at(-1)?.content)).toContain('A screenshot of an error.')
+
+    let followUpMessages: Message[] = []
+    harness.stream.mockImplementationOnce(async (_model, _chatProvider, messages, options) => {
+      followUpMessages = messages
+      await options?.onStreamEvent?.({ type: 'text-delta', text: 'follow-up reply' })
+      await options?.onStreamEvent?.({ type: 'finish', finishReason: 'stop' })
+    })
+
+    await harness.runtime.ingest('what was that error?', {
+      model: 'text-only-model',
+      chatProvider: provider,
+      stripProviderImageAttachments: true,
+    })
+
+    expect(JSON.stringify(followUpMessages)).toContain('A previous settings screen.')
+    expect(JSON.stringify(followUpMessages)).toContain('A screenshot of an error.')
+    expect(JSON.stringify(followUpMessages)).not.toContain('image_url')
+  })
 })

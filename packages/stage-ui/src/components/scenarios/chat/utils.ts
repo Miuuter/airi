@@ -8,7 +8,54 @@ function isTextPart(part: unknown): part is { type: 'text', text?: string } {
     && 'text' in part
 }
 
-function getTextFromContentParts(parts: unknown[]): string {
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null
+}
+
+function isContentPartArray(value: unknown): value is unknown[] {
+  return Array.isArray(value)
+    && value.some(part => isRecord(part) && typeof part.type === 'string')
+}
+
+function parseSerializedContentParts(content: string): unknown[] | undefined {
+  const trimmed = content.trim()
+  if (!trimmed.startsWith('[') && !trimmed.startsWith('{'))
+    return undefined
+
+  try {
+    const parsed = JSON.parse(trimmed) as unknown
+    return normalizeChatContentParts(parsed)
+  }
+  catch {
+    return undefined
+  }
+}
+
+export function normalizeChatContentParts(content: unknown): unknown[] {
+  if (isContentPartArray(content))
+    return content
+
+  if (typeof content === 'string')
+    return parseSerializedContentParts(content) ?? []
+
+  if (isRecord(content)) {
+    if (isContentPartArray(content.content))
+      return content.content
+
+    if (typeof content.content === 'string') {
+      const nestedParts = parseSerializedContentParts(content.content)
+      if (nestedParts?.length)
+        return nestedParts
+    }
+
+    if (typeof content.type === 'string')
+      return [content]
+  }
+
+  return []
+}
+
+export function getTextFromContentParts(parts: unknown[]): string {
   return parts.reduce<string[]>((texts, part) => {
     if (!isTextPart(part))
       return texts
@@ -19,6 +66,57 @@ function getTextFromContentParts(parts: unknown[]): string {
 
     return texts
   }, []).join('\n\n')
+}
+
+function imageUrlFromPart(part: unknown): string | undefined {
+  if (!isRecord(part))
+    return undefined
+
+  const type = typeof part.type === 'string' ? part.type : ''
+  const imageUrl = part.image_url ?? part.imageUrl
+
+  if (type === 'image_url' || type === 'input_image') {
+    if (typeof imageUrl === 'string')
+      return imageUrl
+
+    if (isRecord(imageUrl) && typeof imageUrl.url === 'string')
+      return imageUrl.url
+
+    if (typeof part.url === 'string')
+      return part.url
+  }
+
+  if (type === 'image') {
+    if (typeof part.url === 'string')
+      return part.url
+
+    if (typeof part.imageDataUrl === 'string')
+      return part.imageDataUrl
+
+    const data = typeof part.data === 'string' ? part.data : undefined
+    const mimeType = typeof part.mimeType === 'string' ? part.mimeType : 'image/png'
+    if (data && mimeType.startsWith('image/')) {
+      return data.startsWith('data:')
+        ? data
+        : `data:${mimeType};base64,${data}`
+    }
+  }
+
+  return undefined
+}
+
+export function getImageUrlsFromContentParts(parts: unknown[]): string[] {
+  return parts
+    .map(imageUrlFromPart)
+    .filter((url): url is string => typeof url === 'string' && url.length > 0)
+}
+
+export function getChatHistoryUserDisplayText(message: ChatHistoryItem): string {
+  const parts = normalizeChatContentParts(message.content)
+  if (parts.length)
+    return getTextFromContentParts(parts)
+
+  return typeof message.content === 'string' ? message.content : ''
 }
 
 export function getChatHistoryItemCopyText(message: ChatHistoryItem): string {
@@ -53,7 +151,7 @@ export function getChatHistoryItemCopyText(message: ChatHistoryItem): string {
   }
 
   if (typeof message.content === 'string')
-    return message.content
+    return getChatHistoryUserDisplayText(message)
 
   if (Array.isArray(message.content)) {
     const text = getTextFromContentParts(message.content)
@@ -61,7 +159,7 @@ export function getChatHistoryItemCopyText(message: ChatHistoryItem): string {
     if (text)
       return text
 
-    return message.content.map(entry => JSON.stringify(entry)).join('\n')
+    return ''
   }
 
   return ''

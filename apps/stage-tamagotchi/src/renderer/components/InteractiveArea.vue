@@ -198,6 +198,13 @@ function removeAttachment(index: number) {
   }
 }
 
+function openPendingAttachmentPreview(attachment: { url: string }, index: number) {
+  openImagePreview({
+    title: `Image attachment ${index + 1}`,
+    url: attachment.url,
+  })
+}
+
 watch(sendMode, () => {
   lastEnterTime.value = 0
 })
@@ -315,7 +322,18 @@ async function handleCleanupMessages() {
       ]"
     >
       <div v-for="(attachment, index) in attachments" :key="index" class="relative">
-        <img :src="attachment.url" :class="['h-20 w-20 rounded-md object-cover']">
+        <button
+          type="button"
+          :aria-label="`Open image attachment ${index + 1}`"
+          :class="[
+            'h-20 w-20 overflow-hidden rounded-md outline-none',
+            'cursor-pointer transition-transform active:scale-[0.98]',
+            'focus-visible:ring-2 focus-visible:ring-primary-500/70',
+          ]"
+          @click="openPendingAttachmentPreview(attachment, index)"
+        >
+          <img :src="attachment.url" :alt="`Image attachment ${index + 1}`" class="h-full w-full object-cover transition-opacity hover:opacity-90">
+        </button>
         <button
           :class="[
             'absolute right-1 top-1 h-5 w-5 flex items-center justify-center rounded-full',
